@@ -1,0 +1,1322 @@
+=== СТРУКТУРА ПРОЕКТА ===
+./
+    .dockerignore
+    .env
+    .env.example
+    .gitignore
+    alembic.ini
+    CLAUDE.md
+    docker-compose.yml
+    Dockerfile
+    index.html
+    README.md
+    requirements.txt
+    run.py
+    telegram_pulse.db
+    .pytest_cache/
+        .gitignore
+        CACHEDIR.TAG
+        README.md
+        v/
+            cache/
+                lastfailed
+                nodeids
+    alembic/
+        env.py
+        README
+        script.py.mako
+        versions/
+            825e28371655_initial_migration.py
+    app/
+        api.py
+        cli.py
+        config.py
+        database.py
+        models.py
+        scraper.py
+        __init__.py
+        static/
+    docs/
+        adr/
+            001-metrics-storage.md
+            002-incremental-strategy.md
+    tests/
+        conftest.py
+        test_pulse.py
+        fixtures/
+            channel_preview.html
+            sample_channel.html
+
+
+=== СОДЕРЖИМОЕ ФАЙЛОВ ===
+
+
+--- FILE: .\.dockerignore ---
+.git
+.env
+*.db
+__pycache__
+.pytest_cache
+venv
+.venv
+
+
+--- FILE: .\.env ---
+
+
+--- FILE: .\.env.example ---
+DATABASE_URL=sqlite:///./telegram_pulse.db
+CHANNELS=durov,telegram
+FETCH_INTERVAL=300
+
+
+--- FILE: .\.gitignore ---
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.db
+*.sqlite3
+.env
+
+
+--- FILE: .\alembic.ini ---
+# A generic, single database configuration.
+
+[alembic]
+script_location = %(here)s/alembic
+prepend_sys_path = .
+path_separator = os
+sqlalchemy.url = sqlite:///telegram_pulse.db
+
+[post_write_hooks]
+
+[loggers]
+keys = root,sqlalchemy,alembic
+
+[handlers]
+keys = console
+
+[formatters]
+keys = generic
+
+[logger_root]
+level = WARNING
+handlers = console
+qualname =
+
+[logger_sqlalchemy]
+level = WARNING
+handlers =
+qualname = sqlalchemy.engine
+
+[logger_alembic]
+level = INFO
+handlers =
+qualname = alembic
+
+[handler_console]
+class = StreamHandler
+args = (sys.stderr,)
+level = NOTSET
+formatter = generic
+
+[formatter_generic]
+format = %(levelname)-5.5s [%(name)s] %(message)s
+datefmt = %H:%M:%S
+
+
+--- FILE: .\CLAUDE.md ---
+# Guidelines for Claude Code / Agents
+
+## Architecture & layer boundaries
+- `app/scraper.py` — HTTP-запросы к `t.me/s/<channel>` и парсинг HTML. Ничего не знает
+  про FastAPI, Pydantic-схемы или HTTP-ответы API. На вход — HTML/channel, на выход —
+  записи в БД через SQLAlchemy Session.
+- `app/api.py` — только HTTP-слой (FastAPI роуты, Pydantic-схемы, сериализация).
+  Не парсит HTML и не делает сетевые запросы напрямую.
+- `app/models.py` — только ORM-модели (`Post`, `PostMetric`). Никакой бизнес-логики.
+- `app/database.py` — engine/session/Base. Не трогать без крайней необходимости —
+  меняется вместе с alembic-миграциями.
+- `app/cli.py` — точка входа для ручного/крон-запуска сборщика. Тонкая обёртка над
+  `scraper.fetch_channel_data`, без своей логики парсинга.
+
+## Что не трогать без ADR
+- Схему `posts` + `post_metrics` (см. `docs/adr/001-metrics-storage.md`). Переход на
+  другую модель хранения истории `views` — дорогая миграция данных, обсуждать отдельно.
+- `UniqueConstraint(channel, message_id)` в `posts` — на нём держится идемпотентность
+  `collect`. Убирать/менять только вместе с логикой upsert в `scraper.py`.
+
+## Уже принятые решения (и почему)
+- **Медиана вместо абсолютных views** в `/channels/{name}/top` — чтобы маленький канал
+  не терялся на фоне канала-миллионника. См. ADR-001.
+- **Отдельная таблица `post_metrics`** вместо перезаписи `views` в `posts` — чтобы
+  видеть динамику просмотров во времени, а не только последнее значение.
+- **SQLite** вместо Postgres — сервис внутренний, объём данных небольшой, не стоит
+  усложнять `docker-compose.yml` лишним контейнером БД.
+- **Без очередей/Celery** — фоновый сбор реализован простым `asyncio`-циклом в
+  `run.py` (`run_scraper_loop`), этого достаточно при текущей частоте опроса.
+- **Инкремент = только первая страница `t.me/s/<channel>`.** Осознанное упрощение:
+  предполагается, что `collect` без `--backfill` запускается достаточно часто, чтобы
+  не пропускать посты. См. раздел "Обмеження рішення" в README.
+
+## Running & Testing
+- Установить зависимости: `pip install -r requirements.txt`
+- Применить миграции: `alembic upgrade head`
+- Запустить тесты: `python -m pytest`
+- Запустить сборщик вручную: `python -m app.cli collect` (или `--backfill`)
+- Запустить сервер (сервер сам поднимает и фоновый сборщик): `python run.py`
+
+
+--- FILE: .\docker-compose.yml ---
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./telegram_pulse.db:/app/telegram_pulse.db
+    env_file:
+      - .env
+    restart: always
+
+
+--- FILE: .\Dockerfile ---
+FROM python:3.13-slim
+WORKDIR /app
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY . .
+
+CMD ["python", "run.py"]
+
+
+--- FILE: .\index.html ---
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Channel Pulse</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5f7; margin: 0; padding: 20px; color: #333; }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { text-align: center; margin-bottom: 8px; color: #111; }
+        h2 { margin-top: 32px; color: #333; }
+        table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+        th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid #eee; }
+        th { background: #fafafa; font-size: 0.85em; text-transform: uppercase; color: #888; }
+        tr:last-child td { border-bottom: none; }
+        .channel-name { font-weight: bold; color: #0088cc; cursor: pointer; }
+        .controls { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
+        select { padding: 6px 10px; border-radius: 6px; border: 1px solid #ccc; }
+        .score { font-weight: bold; color: #0088cc; }
+        .post-text { max-width: 420px; white-space: pre-wrap; font-size: 0.9em; }
+        .error { color: #d9534f; background: #fdf7f7; padding: 15px; border-radius: 8px; border: 1px solid #d9534f; text-align: center; }
+        .loading { text-align: center; color: #666; font-style: italic; padding: 12px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Channel Pulse</h1>
+
+        <h2>Канали</h2>
+        <div id="channels-container" class="loading">Завантаження каналів...</div>
+
+        <h2>Топ пости</h2>
+        <div class="controls">
+            <label for="channel-select">Канал:</label>
+            <select id="channel-select"></select>
+            <label for="days-select">За останні:</label>
+            <select id="days-select">
+                <option value="1">1 день</option>
+                <option value="3">3 дні</option>
+                <option value="7" selected>7 днів</option>
+                <option value="30">30 днів</option>
+            </select>
+        </div>
+        <div id="top-container" class="loading">Оберіть канал...</div>
+    </div>
+
+    <script>
+        let selectedChannel = null;
+
+        async function loadChannels() {
+            const container = document.getElementById('channels-container');
+            const select = document.getElementById('channel-select');
+            try {
+                const response = await fetch('/channels');
+                if (!response.ok) throw new Error(`Помилка сервера: ${response.status}`);
+                const channels = await response.json();
+
+                if (!Array.isArray(channels) || channels.length === 0) {
+                    container.innerHTML = '<div class="loading">Каналів поки немає. Запусти `python -m app.cli collect`.</div>';
+                    return;
+                }
+
+                container.innerHTML = `
+                    <table>
+                        <thead><tr><th>Канал</th><th>Постів</th><th>Останній збір</th></tr></thead>
+                        <tbody>
+                            ${channels.map(c => `
+                                <tr>
+                                    <td><span class="channel-name" data-channel="${c.channel}">@${c.channel}</span></td>
+                                    <td>${c.total_posts}</td>
+                                    <td>${c.last_fetched_at ? new Date(c.last_fetched_at).toLocaleString('uk-UA') : '—'}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+
+                select.innerHTML = channels.map(c => `<option value="${c.channel}">@${c.channel}</option>`).join('');
+
+                container.querySelectorAll('.channel-name').forEach(el => {
+                    el.addEventListener('click', () => {
+                        select.value = el.dataset.channel;
+                        loadTop();
+                    });
+                });
+
+                if (channels.length > 0) {
+                    selectedChannel = channels[0].channel;
+                    select.value = selectedChannel;
+                    loadTop();
+                }
+            } catch (err) {
+                container.innerHTML = `<div class="error">Не вдалося завантажити канали: ${err.message}</div>`;
+            }
+        }
+
+        async function loadTop() {
+            const container = document.getElementById('top-container');
+            const channel = document.getElementById('channel-select').value;
+            const days = document.getElementById('days-select').value;
+            if (!channel) return;
+
+            container.innerHTML = '<div class="loading">Завантаження...</div>';
+            try {
+                const response = await fetch(`/channels/${encodeURIComponent(channel)}/top?days=${days}`);
+                if (!response.ok) throw new Error(`Помилка сервера: ${response.status}`);
+                const posts = await response.json();
+
+                if (!Array.isArray(posts) || posts.length === 0) {
+                    container.innerHTML = '<div class="loading">Постів за цей період немає.</div>';
+                    return;
+                }
+
+                container.innerHTML = `
+                    <table>
+                        <thead><tr><th>Текст</th><th>Переглядів</th><th>Score</th><th>Дата</th></tr></thead>
+                        <tbody>
+                            ${posts.map(p => `
+                                <tr>
+                                    <td class="post-text">${(p.text || '<i>(без тексту)</i>').slice(0, 200)}</td>
+                                    <td>${p.current_views}</td>
+                                    <td class="score">${p.score}×</td>
+                                    <td>${p.datetime ? new Date(p.datetime).toLocaleString('uk-UA') : '—'}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+            } catch (err) {
+                container.innerHTML = `<div class="error">Не вдалося завантажити пости: ${err.message}</div>`;
+            }
+        }
+
+        document.getElementById('channel-select').addEventListener('change', loadTop);
+        document.getElementById('days-select').addEventListener('change', loadTop);
+
+        document.addEventListener('DOMContentLoaded', loadChannels);
+    </script>
+</body>
+</html>
+
+
+--- FILE: .\README.md ---
+# Telegram Web Scraper & Analytics API
+
+Сервіс для інкрементального збору публічних Telegram-каналів через веб-версію
+(`t.me/s/<channel>`) та надання аналітики через REST API.
+
+## ⚡ Швидкий запуск (до 5 хвилин)
+
+Створити файл конфігурації:
+```
+cp .env.example .env
+```
+
+Запустити через Docker Compose:
+```
+docker compose up --build
+```
+
+Контейнер сам одразу піднімає фоновий збір (кожні `FETCH_INTERVAL` секунд), тож
+перші дані з'являться протягом хвилини після старту навіть без ручного виклику CLI.
+
+Перевірка роботи:
+- Swagger UI (API Docs): http://localhost:8000/docs
+- Healthcheck: http://localhost:8000/healthz
+- Фронтенд: http://localhost:8000/
+
+## 🛠️ CLI команди (ручний збір)
+
+Всередині контейнера:
+```
+docker compose exec app python -m app.cli collect
+docker compose exec app python -m app.cli collect --backfill
+```
+
+Локально (без Docker, з кореня проєкту, після `pip install -r requirements.txt`):
+```
+python -m app.cli collect
+python -m app.cli collect --backfill
+```
+
+## 📊 Формула топ-постів (`GET /channels/{name}/top`)
+
+Ендпоїнт визначає найпопулярніші пости каналу за останні N днів (`days`, за
+замовчуванням 7):
+
+1. Береться вибірка всіх постів каналу за вказаний період.
+2. Обчислюється медіана переглядів (`M`) серед постів вибірки.
+3. Для кожного поста рахується `score = views / M`.
+4. Пости сортуються за спаданням `score`.
+
+Медіана, а не абсолютні перегляди, використана свідомо — щоб маленький канал не
+губився на фоні великого: у обох випадках "вірусний" пост — це той, що суттєво
+відхиляється від типового для свого ж каналу, а не для Telegram в цілому.
+
+## 📈 Динаміка переглядів
+
+При кожному запуску скрапера поточна кількість переглядів поста записується в
+окрему таблицю `post_metrics` з часовою міткою `fetched_at`, замість
+перезапису значення в `posts`. Це дозволяє зберігати часовий ряд і бачити,
+як швидко пост набирає перегляди між заходами збирача, а не лише останнє
+значення. Деталі рішення — у `docs/adr/001-metrics-storage.md`.
+
+## ⚠️ Обмеження рішення
+
+- Інкрементальний `collect` (без `--backfill`) читає лише першу сторінку
+  `t.me/s/<channel>` (~20 останніх постів). Якщо канал постить частіше, ніж
+  запускається збір, частина постів між двома запусками може бути пропущена.
+  Це свідомий компроміс: припускається, що фоновий цикл (`FETCH_INTERVAL`,
+  за замовчуванням 300с) запускається достатньо часто.
+- Ретраїв — обмежена кількість (3 спроби з backoff) на рівні одного HTTP-запиту;
+  немає окремого rate-limit throttling понад невелику паузу між сторінками
+  `--backfill`.
+- Немає дедуплікації "та сама новина в різних каналах" — це опціональна LLM-частина
+  ТЗ, яку в цій версії не реалізовано (обрано фронт замість неї).
+- Парсер завʼязаний на поточну розмітку `t.me/s/`; при зміні верстки Telegram
+  парсинг зламається без явного попередження (лог warning при 0 знайдених постах).
+
+## 🚫 Що не зроблено і чому
+
+- **LLM-кластеризація новин та Telegram-бот** — з опціональних частин ТЗ обрано
+  тільки фронт (таблиця каналів + топ-пости з фільтром за періодом), оскільки
+  на "одне, не більше" пункт треба обирати один напрямок, а решта часу пішла на
+  стійкість збору (ретраї) та тести.
+- **Retry з експоненційним backoff понад 3 спроби / окремий rate-limiter** —
+  не реалізовано через обмеження часу тестового завдання; поточних 3 спроб з
+  паузою вистачає для типових тимчасових збоїв мережі, але не для тривалого
+  rate-limit з боку Telegram.
+- **Повноцінна пагінація "нових" постів в інкрементальному режимі** (з
+  зупинкою рівно на останньому відомому `message_id`, а не просто "перша
+  сторінка") — не реалізовано, див. розділ "Обмеження рішення" вище.
+
+## 🧪 Тести
+
+```
+python -m pytest
+```
+
+Без мережі: парсинг HTML з фікстур (`tests/fixtures/`), ідемпотентність
+повторного `collect`, арифметика медіани в `/channels/{name}/top` через
+`TestClient` (реальний виклик ендпоінта, а не переобчислення формули окремо).
+
+
+--- FILE: .\requirements.txt ---
+httpx
+beautifulsoup4
+fastapi
+uvicorn
+pydantic-settings
+sqlalchemy
+alembic
+pytest
+
+
+--- FILE: .\run.py ---
+import asyncio
+import uvicorn
+from app.api import app
+from app.scraper import run_scraper_loop
+
+async def main():
+    asyncio.create_task(run_scraper_loop())
+    config = uvicorn.Config(app=app, host="0.0.0.0", port=8000, log_level="info")
+    server = uvicorn.Server(config)
+    await server.serve()
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+--- FILE: .\telegram_pulse.db ---
+[Не удалось прочитать файл: 'utf-8' codec can't decode byte 0xf8 in position 102: invalid start byte]
+
+
+--- FILE: .\.pytest_cache\.gitignore ---
+# Created by pytest automatically.
+*
+
+
+--- FILE: .\.pytest_cache\CACHEDIR.TAG ---
+Signature: 8a477f597d28d172789f06886806bc55
+# This file is a cache directory tag created by pytest.
+# For information about cache directory tags, see:
+#	https://bford.info/cachedir/spec.html
+
+
+--- FILE: .\.pytest_cache\README.md ---
+# pytest cache directory #
+
+This directory contains data from the pytest's cache plugin,
+which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
+
+**Do not** commit this to version control.
+
+See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+
+
+--- FILE: .\.pytest_cache\v\cache\lastfailed ---
+{}
+
+--- FILE: .\.pytest_cache\v\cache\nodeids ---
+[
+  "tests/test_pulse.py::test_analytics_median",
+  "tests/test_pulse.py::test_analytics_median_math",
+  "tests/test_pulse.py::test_analytics_median_score",
+  "tests/test_pulse.py::test_channel_top_endpoint",
+  "tests/test_pulse.py::test_idempotency",
+  "tests/test_pulse.py::test_parse_html_fixture",
+  "tests/test_pulse.py::test_parse_html_fixture_and_idempotency",
+  "tests/test_pulse.py::test_parser_with_fixture",
+  "tests/test_pulse.py::test_views_parsing"
+]
+
+--- FILE: .\alembic\env.py ---
+from logging.config import fileConfig
+
+from sqlalchemy import engine_from_config
+from sqlalchemy import pool
+
+from alembic import context
+
+config = context.config
+
+if config.config_file_name is not None:
+    fileConfig(config.config_file_name)
+
+from app.database import Base
+from app.models import Post, PostMetric
+
+target_metadata = Base.metadata
+
+
+def run_migrations_offline() -> None:
+    url = config.get_main_option("sqlalchemy.url")
+    context.configure(
+        url=url,
+        target_metadata=target_metadata,
+        literal_binds=True,
+        dialect_opts={"paramstyle": "named"},
+    )
+
+    with context.begin_transaction():
+        context.run_migrations()
+
+
+def run_migrations_online() -> None:
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+    with connectable.connect() as connection:
+        context.configure(
+            connection=connection, target_metadata=target_metadata
+        )
+
+        with context.begin_transaction():
+            context.run_migrations()
+
+
+if context.is_offline_mode():
+    run_migrations_offline()
+else:
+    run_migrations_online()
+
+
+--- FILE: .\alembic\README ---
+Generic single-database configuration.
+
+
+--- FILE: .\alembic\script.py.mako ---
+"""${message}
+
+Revision ID: ${up_revision}
+Revises: ${down_revision | comma,n}
+Create Date: ${create_date}
+
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+${imports if imports else ""}
+
+# revision identifiers, used by Alembic.
+revision: str = ${repr(up_revision)}
+down_revision: Union[str, Sequence[str], None] = ${repr(down_revision)}
+branch_labels: Union[str, Sequence[str], None] = ${repr(branch_labels)}
+depends_on: Union[str, Sequence[str], None] = ${repr(depends_on)}
+
+
+def upgrade() -> None:
+    """Upgrade schema."""
+    ${upgrades if upgrades else "pass"}
+
+
+def downgrade() -> None:
+    """Downgrade schema."""
+    ${downgrades if downgrades else "pass"}
+
+
+--- FILE: .\alembic\versions\825e28371655_initial_migration.py ---
+"""initial_migration
+
+Revision ID: 825e28371655
+Revises:
+Create Date: 2026-09-04
+"""
+from typing import Sequence, Union
+from alembic import op
+import sqlalchemy as sa
+
+revision: str = '825e28371655'
+down_revision: Union[str, None] = None
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+def upgrade() -> None:
+    op.create_table(
+        'posts',
+        sa.Column('id', sa.Integer(), nullable=False),
+        sa.Column('channel', sa.String(), nullable=False),
+        sa.Column('message_id', sa.Integer(), nullable=False),
+        sa.Column('datetime', sa.DateTime(timezone=True), nullable=False),
+        sa.Column('text', sa.Text(), nullable=True),
+        sa.Column('views', sa.Integer(), nullable=True),
+        sa.Column('media_type', sa.String(), nullable=True),
+        sa.Column('forwarded_from', sa.String(), nullable=True),
+        sa.Column('fetched_at', sa.DateTime(timezone=True), nullable=False),
+        sa.PrimaryKeyConstraint('id'),
+        sa.UniqueConstraint('channel', 'message_id', name='uq_channel_message')
+    )
+    op.create_table(
+        'post_metrics',
+        sa.Column('id', sa.Integer(), nullable=False),
+        sa.Column('post_id', sa.Integer(), nullable=False),
+        sa.Column('views', sa.Integer(), nullable=False),
+        sa.Column('fetched_at', sa.DateTime(timezone=True), nullable=False),
+        sa.ForeignKeyConstraint(['post_id'], ['posts.id'], ondelete='CASCADE'),
+        sa.PrimaryKeyConstraint('id')
+    )
+
+def downgrade() -> None:
+    op.drop_table('post_metrics')
+    op.drop_table('posts')
+
+
+--- FILE: .\app\api.py ---
+import os
+from typing import List, Optional
+from datetime import datetime as dt_type, timedelta, timezone
+import statistics
+from fastapi import FastAPI, Depends, Query, HTTPException
+from fastapi.responses import FileResponse, HTMLResponse
+from sqlalchemy import func, desc, asc
+from sqlalchemy.orm import Session, joinedload
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.database import SessionLocal, engine, Base
+from app.models import Post, PostMetric
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="Telegram Channel Parser API")
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# --- Pydantic Схемы ---
+class MetricSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    views: int
+    fetched_at: Optional[dt_type] = Field(default=None)
+
+class PostSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    channel: str
+    message_id: int
+    text: Optional[str] = Field(default=None)
+    datetime: Optional[dt_type] = Field(default=None)
+    media_type: Optional[str] = Field(default=None)
+    forwarded_from: Optional[str] = Field(default=None)
+    fetched_at: Optional[dt_type] = Field(default=None)
+    metrics: List[MetricSchema] = []
+
+class TopPostSchema(PostSchema):
+    score: float
+    current_views: int
+
+class ChannelStatSchema(BaseModel):
+    channel: str
+    total_posts: int
+    last_fetched_at: Optional[dt_type] = None
+
+# --- Healthcheck ---
+@app.get("/healthz")
+def healthz():
+    return {"status": "ok"}
+
+# --- UI ---
+@app.get("/", response_class=HTMLResponse)
+def read_index():
+    possible_paths = ["index.html", "static/index.html", "app/static/index.html"]
+    for path in possible_paths:
+        if os.path.exists(path):
+            return FileResponse(path)
+    return "<h3>API Online. Go to <a href='/docs'>/docs</a></h3>"
+
+# --- Эндпоинты по ТЗ ---
+
+@app.get("/channels", response_model=List[ChannelStatSchema])
+def get_channels(db: Session = Depends(get_db)):
+    """Список каналов с количеством постов и датой последнего сбора."""
+    results = db.query(
+        Post.channel,
+        func.count(Post.id).label("total_posts"),
+        func.max(Post.fetched_at).label("last_fetched_at")
+    ).group_by(Post.channel).all()
+
+    return [
+        ChannelStatSchema(
+            channel=r.channel,
+            total_posts=r.total_posts,
+            last_fetched_at=r.last_fetched_at
+        ) for r in results
+    ]
+
+@app.get("/posts", response_model=List[PostSchema])
+def get_posts(
+    channel: Optional[str] = Query(None, description="Фильтр по каналу"),
+    since: Optional[dt_type] = Query(None, description="Фильтр по дате (ISO format)"),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    order: str = Query("date", pattern="^(date|views)$", description="Сортировка: date или views"),
+    db: Session = Depends(get_db)
+):
+    """Список постов с фильтрацией, пагинацией и сортировкой."""
+    query = db.query(Post).options(joinedload(Post.metrics))
+
+    if channel:
+        query = query.filter(Post.channel == channel)
+    if since:
+        query = query.filter(Post.datetime >= since)
+
+    if order == "date":
+        query = query.order_by(Post.datetime.desc())
+    elif order == "views":
+        # Сортировка по последним просмотрам
+        subq = db.query(
+            PostMetric.post_id,
+            func.max(PostMetric.views).label("max_views")
+        ).group_by(PostMetric.post_id).subquery()
+
+        query = query.outerjoin(subq, Post.id == subq.c.post_id).order_by(desc(subq.c.max_views))
+
+    return query.offset(offset).limit(limit).all()
+
+@app.get("/channels/{name}/top", response_model=List[TopPostSchema])
+def get_channel_top(
+    name: str,
+    days: int = Query(7, ge=1, le=365),
+    limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db)
+):
+    """Топ-посты за N дней относительно медианы канала."""
+    cutoff = dt_type.now(timezone.utc) - timedelta(days=days)
+
+    posts = db.query(Post).options(joinedload(Post.metrics)).filter(
+        Post.channel == name,
+        Post.datetime >= cutoff
+    ).all()
+
+    if not posts:
+        return []
+
+    # Собираем актуальные просмотры для каждого поста
+    post_views_map = []
+    for p in posts:
+        latest_views = p.metrics[-1].views if p.metrics else 0
+        post_views_map.append((p, latest_views))
+
+    all_views = [v for _, v in post_views_map]
+    if not all_views:
+        return []
+
+    med = statistics.median(all_views)
+    if med == 0:
+        med = 1.0  # Избегаем деления на 0
+
+    result = []
+    for p, v in post_views_map:
+        score = round(v / med, 2)
+        p_dict = PostSchema.model_validate(p).model_dump()
+        p_dict["score"] = score
+        p_dict["current_views"] = v
+        result.append(p_dict)
+
+    # Сортируем по score
+    result.sort(key=lambda x: x["score"], reverse=True)
+    return result[:limit]
+
+
+--- FILE: .\app\cli.py ---
+import argparse
+import asyncio
+import logging
+from app.config import settings
+from app.scraper import fetch_channel_data
+
+logger = logging.getLogger(__name__)
+
+
+async def main():
+    parser = argparse.ArgumentParser(description="CLI Скрапер Telegram-каналов")
+    parser.add_argument("command", choices=["collect"], help="Команда для сбора данных")
+    parser.add_argument("--backfill", action="store_true", help="Глубокий сбор истории")
+    args = parser.parse_args()
+
+    if args.command == "collect":
+        channels = [c.strip() for c in settings.CHANNELS.split(",") if c.strip()]
+        if not channels:
+            logger.warning("Список каналов пуст — проверь CHANNELS в .env")
+            return
+
+        for channel in channels:
+            try:
+                await fetch_channel_data(channel, backfill=args.backfill)
+            except Exception as e:
+                logger.error(f"[{channel}] Не удалось собрать канал: {e}")
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+--- FILE: .\app\config.py ---
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+class Settings(BaseSettings):
+    DATABASE_URL: str = "sqlite:///./telegram_pulse.db"
+    CHANNELS: str = "durov,telegram"
+    FETCH_INTERVAL: int = 300
+
+    model_config = SettingsConfigDict(env_file=".env")
+
+settings = Settings()
+
+
+--- FILE: .\app\database.py ---
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker, DeclarativeBase
+
+from app.config import settings
+
+engine = create_engine(settings.DATABASE_URL, connect_args={"check_same_thread": False})
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+class Base(DeclarativeBase):
+    pass
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+--- FILE: .\app\models.py ---
+from datetime import datetime, timezone
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Text
+from sqlalchemy.orm import relationship
+from app.database import Base
+
+class Post(Base):
+    __tablename__ = "posts"
+
+    id = Column(Integer, primary_key=True, index=True)
+    channel = Column(String, index=True, nullable=False)
+    message_id = Column(Integer, index=True, nullable=False)
+    text = Column(Text, nullable=True)
+    datetime = Column(DateTime(timezone=True), nullable=True)
+    media_type = Column(String, nullable=True)
+    forwarded_from = Column(String, nullable=True)
+    fetched_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    metrics = relationship("PostMetric", back_populates="post", cascade="all, delete-orphan")
+
+
+class PostMetric(Base):
+    __tablename__ = "post_metrics"
+
+    id = Column(Integer, primary_key=True, index=True)
+    post_id = Column(Integer, ForeignKey("posts.id", ondelete="CASCADE"), nullable=False)
+    views = Column(Integer, default=0)
+    fetched_at = Column(DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc))
+
+    post = relationship("Post", back_populates="metrics")
+
+
+--- FILE: .\app\scraper.py ---
+import asyncio
+import logging
+from typing import Optional
+from datetime import datetime, timezone
+import httpx
+from bs4 import BeautifulSoup
+from sqlalchemy.orm import Session
+
+from app.config import settings
+from app.database import SessionLocal
+from app.models import Post, PostMetric
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 2
+PAUSE_BETWEEN_PAGES_SECONDS = 1
+
+
+def parse_views(views_raw: str) -> int:
+    """Конвертирует строковые просмотры ('1.5K', '2M', '500') в число int."""
+    if not views_raw:
+        return 0
+    clean = views_raw.strip().upper().replace(" ", "").replace("\xa0", "")
+    try:
+        if "K" in clean:
+            return int(float(clean.replace("K", "")) * 1_000)
+        if "M" in clean:
+            return int(float(clean.replace("M", "")) * 1_000_000)
+        return int(clean)
+    except ValueError:
+        return 0
+
+
+def parse_html_and_save(db: Session, html_content: str, channel: str) -> tuple[int, Optional[int]]:
+    soup = BeautifulSoup(html_content, "html.parser")
+    message_widgets = soup.find_all("div", class_="tgme_widget_message")
+
+    if not message_widgets:
+        return 0, None
+
+    added_count = 0
+    first_msg_id = None
+    now_utc = datetime.now(timezone.utc)
+
+    for widget in message_widgets:
+        raw_id = widget.get("data-post")
+        if not raw_id or "/" not in raw_id:
+            continue
+
+        message_id = int(raw_id.split("/")[-1])
+        if first_msg_id is None:
+            first_msg_id = message_id
+
+        # Текст поста
+        text_el = widget.find("div", class_="tgme_widget_message_text")
+        text = text_el.get_text(separator="\n", strip=True) if text_el else ""
+
+        # Просмотры
+        views_el = widget.find("span", class_="tgme_widget_message_views")
+        views_raw = views_el.text.strip() if views_el else "0"
+        views_count = parse_views(views_raw)
+
+        # Парсинг даты
+        time_el = widget.find("time")
+        post_datetime = None
+        if time_el and time_el.has_attr("datetime"):
+            try:
+                dt_str = time_el["datetime"].replace("Z", "+00:00")
+                post_datetime = datetime.fromisoformat(dt_str)
+            except ValueError:
+                post_datetime = None
+
+        # Страховка: если тега time нет или дата не распарсилась — берем текущую
+        if not post_datetime:
+            post_datetime = now_utc
+
+        # Медиа
+        media_type = None
+        if widget.find("a", class_="tgme_widget_message_photo_wrap"):
+            media_type = "photo"
+        elif widget.find("video") or widget.find("a", class_="tgme_widget_message_video_player"):
+            media_type = "video"
+        elif widget.find("div", class_="tgme_widget_message_document"):
+            media_type = "document"
+        elif widget.find("a", class_="tgme_widget_message_voice_player"):
+            media_type = "voice"
+
+        # Репост
+        fwd_el = widget.find("a", class_="tgme_widget_message_forwarded_from_name")
+        forwarded_from = fwd_el.text.strip() if fwd_el else None
+
+        # Сохранение / обновление поста
+        post = db.query(Post).filter(Post.channel == channel, Post.message_id == message_id).first()
+        if not post:
+            post = Post(
+                channel=channel,
+                message_id=message_id,
+                text=text,
+                datetime=post_datetime,
+                media_type=media_type,
+                forwarded_from=forwarded_from,
+                fetched_at=now_utc
+            )
+            db.add(post)
+            db.flush()
+            added_count += 1
+        else:
+            if not post.datetime:
+                post.datetime = post_datetime
+            if media_type:
+                post.media_type = media_type
+            if forwarded_from:
+                post.forwarded_from = forwarded_from
+
+        # Добавление метрики
+        metric = PostMetric(
+            post_id=post.id,
+            views=views_count,
+            fetched_at=now_utc
+        )
+        db.add(metric)
+
+    db.commit()
+    return added_count, first_msg_id
+
+
+async def _fetch_page_with_retries(client: httpx.AsyncClient, url: str, channel: str) -> Optional[httpx.Response]:
+    """Делает GET с несколькими попытками и backoff. Возвращает None, если все попытки не удались."""
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            resp = await client.get(url, headers={"User-Agent": "Mozilla/5.0"})
+            if resp.status_code == 200:
+                return resp
+            logger.warning(f"[{channel}] попытка {attempt}/{MAX_RETRIES}: HTTP {resp.status_code} на {url}")
+        except httpx.HTTPError as e:
+            logger.warning(f"[{channel}] попытка {attempt}/{MAX_RETRIES}: сетевая ошибка ({e}) на {url}")
+
+        if attempt < MAX_RETRIES:
+            await asyncio.sleep(RETRY_BACKOFF_SECONDS * attempt)
+
+    logger.error(f"[{channel}] не удалось получить {url} после {MAX_RETRIES} попыток")
+    return None
+
+
+async def fetch_channel_data(channel: str, backfill: bool = False, max_pages: int = 5):
+    url = f"https://t.me/s/{channel}"
+
+    async with httpx.AsyncClient(timeout=15.0) as client:
+        current_url = url
+        pages_scraped = 0
+        total_added = 0
+
+        while current_url and pages_scraped < (max_pages if backfill else 1):
+            resp = await _fetch_page_with_retries(client, current_url, channel)
+            if resp is None:
+                # Все попытки исчерпаны для этой страницы — прекращаем сбор
+                # по каналу, но не роняем весь процесс.
+                break
+
+            db = SessionLocal()
+            try:
+                added, first_id = parse_html_and_save(db, resp.text, channel)
+                total_added += added
+                pages_scraped += 1
+
+                if backfill and first_id:
+                    current_url = f"https://t.me/s/{channel}?before={first_id}"
+                    if pages_scraped < max_pages:
+                        await asyncio.sleep(PAUSE_BETWEEN_PAGES_SECONDS)
+                else:
+                    break
+            finally:
+                db.close()
+
+        logger.info(f"[{channel}] Сбор завершен. Страниц: {pages_scraped}, новых постов: {total_added}")
+
+
+def fetch_channel(db: Session, channel: str, backfill: bool = False):
+    """Синхронный запуск для CLI"""
+    asyncio.run(fetch_channel_data(channel, backfill=backfill))
+
+
+async def run_scraper_loop():
+    logger.info("Запуск фонового скрапера...")
+    channels = [c.strip() for c in settings.CHANNELS.split(",") if c.strip()]
+
+    while True:
+        for channel in channels:
+            try:
+                await fetch_channel_data(channel, backfill=False)
+            except Exception as e:
+                logger.error(f"Ошибка скрапинга канала {channel}: {e}")
+
+        await asyncio.sleep(settings.FETCH_INTERVAL)
+
+
+--- FILE: .\app\__init__.py ---
+
+
+--- FILE: .\docs\adr\001-metrics-storage.md ---
+# 1. Збереження метрик та парсинг Telegram Web View
+
+## Статус
+Прийнято
+
+## Контекст
+Необхідно збирати публічні пости з `t.me/s/<channel>` без використання офіційного
+API / Bot API, підтримувати ідемпотентність та відстежувати динаміку переглядів.
+
+## Рішення
+1. **Парсинг HTML**: використано `BeautifulSoup4` для розбору веб-сторінок `t.me/s/`.
+2. **Збереження даних**:
+   - `posts`: зберігає унікальний пост (`channel` + `message_id`).
+   - `post_metrics`: записує точний зріз переглядів (`views`) та час фіксації
+     (`fetched_at`) під час кожного запуску скрапера.
+3. **Ідемпотентність**: забезпечується через `UniqueConstraint("channel", "message_id")`.
+
+## Наслідки
+- Можливість будувати графіки зміни переглядів з часом.
+- Відсутність дублікатів постів при повторних запусках `collect`.
+- Таблиця `post_metrics` росте необмежено — прийнятно для обсягу тестового завдання,
+  але при довгій експлуатації знадобиться ретеншн/агрегація старих точок.
+
+
+--- FILE: .\docs\adr\002-incremental-strategy.md ---
+# 2. Стратегія інкрементального збору
+
+## Статус
+Прийнято
+
+## Контекст
+`t.me/s/<channel>` не дає офіційної пагінації "дай усе нове після message_id=X" —
+є лише параметр `?before=<id>` для руху вглиб історії. Потрібно вирішити, як
+влаштований звичайний (не `--backfill`) прохід `collect`.
+
+## Розглянуті варіанти
+1. Читати тільки першу (найновішу) сторінку щоразу.
+2. Читати сторінки, поки не зустрінеться вже відомий `message_id`, і лише тоді
+   зупинятись (справжній "інкремент до останнього відомого").
+
+## Рішення
+Обрано варіант 1 — простіший, і достатній за умови, що фоновий цикл (`FETCH_INTERVAL`)
+запускається частіше, ніж канал встигає накопичити більше постів, ніж влазить на одну
+сторінку (~20 постів).
+
+## Наслідки
+- Якщо канал дуже активний або збір призупинявся надовго — частина постів між двома
+  запусками може бути пропущена без явної помилки.
+- `--backfill` покриває цей ризик заднім числом (глибокий прохід по історії).
+- Перехід на варіант 2 не потребує зміни схеми БД — лише зміни циклу в
+  `scraper.fetch_channel_data`, тож відкат/апгрейд цього рішення дешевий на рівні
+  коду, хоча й вимагає окремого тестування пагінації.
+
+
+--- FILE: .\tests\conftest.py ---
+import sys
+from pathlib import Path
+
+# Додаємо кореневу директорію проєкту до sys.path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+
+--- FILE: .\tests\test_pulse.py ---
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+
+import pytest
+from fastapi.testclient import TestClient
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.pool import StaticPool
+
+from app.database import Base
+from app.models import Post, PostMetric
+from app.scraper import parse_html_and_save, parse_views
+
+TEST_DATABASE_URL = "sqlite:///:memory:"
+
+
+@pytest.fixture
+def db_session():
+    # StaticPool держит одно и то же соединение на все потоки — без этого
+    # TestClient (который выполняет запрос в отдельном потоке через anyio)
+    # видит уже другую, пустую in-memory базу ("no such table").
+    engine = create_engine(
+        TEST_DATABASE_URL,
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    Base.metadata.create_all(bind=engine)
+    TestingSessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+    session = TestingSessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+def test_parse_html_fixture_and_idempotency(db_session):
+    fixture_path = Path(__file__).parent / "fixtures" / "channel_preview.html"
+    html_content = fixture_path.read_text(encoding="utf-8")
+
+    # 1. Первый проход
+    added, _ = parse_html_and_save(db_session, html_content, "durov")
+    assert added == 2
+    assert db_session.query(Post).count() == 2
+    assert db_session.query(PostMetric).count() == 2
+
+    # 2. Повторный проход (идемпотентность)
+    added_again, _ = parse_html_and_save(db_session, html_content, "durov")
+    assert added_again == 0  # новые посты не создаются
+    assert db_session.query(Post).count() == 2
+    assert db_session.query(PostMetric).count() == 4  # метрики продолжают копиться
+
+
+def test_views_parsing():
+    assert parse_views("100") == 100
+    assert parse_views("1.5K") == 1500
+    assert parse_views("2.5M") == 2500000
+    assert parse_views("") == 0
+
+
+def test_analytics_median_math():
+    """Сама формула медианы/score — быстрая проверка арифметики без БД и HTTP."""
+    import statistics
+
+    views_list = [1000, 2000, 3000, 4000, 10000]  # медиана = 3000
+    median_val = statistics.median(views_list)
+    assert median_val == 3000
+
+    post_views = 6000
+    score = round(post_views / median_val, 2)
+    assert score == 2.0
+
+
+def test_channel_top_endpoint(db_session, monkeypatch):
+    """Реальный вызов /channels/{name}/top через TestClient — проверяем,
+    что ручка действительно считает score по медиане, а не только формула сама по себе."""
+    from app import api as api_module
+
+    # Подменяем зависимость get_db на тестовую in-memory сессию
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
+
+    api_module.app.dependency_overrides[api_module.get_db] = override_get_db
+    client = TestClient(api_module.app)
+
+    now = datetime.now(timezone.utc)
+
+    def make_post(message_id: int, views: int, days_ago: int = 1):
+        post = Post(
+            channel="durov",
+            message_id=message_id,
+            text=f"post {message_id}",
+            datetime=now - timedelta(days=days_ago),
+            fetched_at=now,
+        )
+        db_session.add(post)
+        db_session.flush()
+        db_session.add(PostMetric(post_id=post.id, views=views, fetched_at=now))
+        db_session.commit()
+
+    # Медиана views = 3000 (посты: 1000, 2000, 3000, 4000, 10000)
+    make_post(1, 1000)
+    make_post(2, 2000)
+    make_post(3, 3000)
+    make_post(4, 4000)
+    make_post(5, 10000)
+
+    response = client.get("/channels/durov/top", params={"days": 7})
+    assert response.status_code == 200
+    data = response.json()
+
+    assert len(data) == 5
+    # Топ пост — 10000 просмотров, score = 10000 / 3000 ≈ 3.33
+    assert data[0]["current_views"] == 10000
+    assert data[0]["score"] == pytest.approx(3.33, abs=0.01)
+    # Порядок по убыванию score
+    scores = [item["score"] for item in data]
+    assert scores == sorted(scores, reverse=True)
+
+    api_module.app.dependency_overrides.clear()
+
+
+--- FILE: .\tests\fixtures\channel_preview.html ---
+<!DOCTYPE html>
+<html>
+<body>
+  <div class="tgme_widget_message" data-post="durov/500">
+    <div class="tgme_widget_message_text">First test post from fixture</div>
+    <span class="tgme_widget_message_views">100K</span>
+  </div>
+  <div class="tgme_widget_message" data-post="durov/501">
+    <div class="tgme_widget_message_text">Second test post from fixture</div>
+    <span class="tgme_widget_message_views">250K</span>
+  </div>
+</body>
+</html>
+
+
+--- FILE: .\tests\fixtures\sample_channel.html ---
+<div class="tgme_widget_message" data-post="durov/100">
+  <div class="tgme_widget_message_text">Test message content</div>
+  <span class="tgme_widget_message_views">1.5K</span>
+  <time datetime="2026-01-01T12:00:00+00:00"></time>
+</div>
+<div class="tgme_widget_message" data-post="durov/101">
+  <div class="tgme_widget_message_text">Second test message</div>
+  <span class="tgme_widget_message_views">3.0K</span>
+  <time datetime="2026-01-02T12:00:00+00:00"></time>
+</div>

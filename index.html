@@ -2,45 +2,139 @@
 <html lang="uk">
 <head>
     <meta charset="UTF-8">
-    <title>Channel Pulse - Posts</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Channel Pulse</title>
     <style>
-        body { font-family: sans-serif; background: #f4f6f8; margin: 0; padding: 20px; }
-        .container { max-width: 800px; margin: 0 auto; }
-        h1 { color: #333; }
-        .card { background: white; padding: 15px 20px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 2px 4px rgba(0,0,0,0.05); }
-        .card-header { display: flex; justify-content: space-between; color: #777; font-size: 14px; margin-bottom: 10px; }
-        .text { font-size: 16px; line-height: 1.5; color: #222; white-space: pre-line; }
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #f4f5f7; margin: 0; padding: 20px; color: #333; }
+        .container { max-width: 900px; margin: 0 auto; }
+        h1 { text-align: center; margin-bottom: 8px; color: #111; }
+        h2 { margin-top: 32px; color: #333; }
+        table { width: 100%; border-collapse: collapse; background: #fff; border-radius: 10px; overflow: hidden; box-shadow: 0 2px 8px rgba(0,0,0,0.06); }
+        th, td { text-align: left; padding: 10px 14px; border-bottom: 1px solid #eee; }
+        th { background: #fafafa; font-size: 0.85em; text-transform: uppercase; color: #888; }
+        tr:last-child td { border-bottom: none; }
+        .channel-name { font-weight: bold; color: #0088cc; cursor: pointer; }
+        .controls { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
+        select { padding: 6px 10px; border-radius: 6px; border: 1px solid #ccc; }
+        .score { font-weight: bold; color: #0088cc; }
+        .post-text { max-width: 420px; white-space: pre-wrap; font-size: 0.9em; }
+        .error { color: #d9534f; background: #fdf7f7; padding: 15px; border-radius: 8px; border: 1px solid #d9534f; text-align: center; }
+        .loading { text-align: center; color: #666; font-style: italic; padding: 12px; }
     </style>
 </head>
 <body>
     <div class="container">
-        <h1>Пости з Telegram</h1>
-        <div id="posts-container">Завантаження...</div>
+        <h1>Channel Pulse</h1>
+
+        <h2>Канали</h2>
+        <div id="channels-container" class="loading">Завантаження каналів...</div>
+
+        <h2>Топ пости</h2>
+        <div class="controls">
+            <label for="channel-select">Канал:</label>
+            <select id="channel-select"></select>
+            <label for="days-select">За останні:</label>
+            <select id="days-select">
+                <option value="1">1 день</option>
+                <option value="3">3 дні</option>
+                <option value="7" selected>7 днів</option>
+                <option value="30">30 днів</option>
+            </select>
+        </div>
+        <div id="top-container" class="loading">Оберіть канал...</div>
     </div>
 
     <script>
-        async function loadPosts() {
-            const response = await fetch('/posts');
-            const posts = await response.json();
-            
-            const container = document.getElementById('posts-container');
-            container.innerHTML = '';
+        let selectedChannel = null;
 
-            posts.forEach(post => {
-                const card = document.createElement('div');
-                card.className = 'card';
-                card.innerHTML = `
-                    <div class="card-header">
-                        <span><strong>@${post.channel}</strong></span>
-                        <span>👁 ${post.views} | 📅 ${post.date.split('T')[0] || post.date}</span>
-                    </div>
-                    <div class="text">${post.text}</div>
+        async function loadChannels() {
+            const container = document.getElementById('channels-container');
+            const select = document.getElementById('channel-select');
+            try {
+                const response = await fetch('/channels');
+                if (!response.ok) throw new Error(`Помилка сервера: ${response.status}`);
+                const channels = await response.json();
+
+                if (!Array.isArray(channels) || channels.length === 0) {
+                    container.innerHTML = '<div class="loading">Каналів поки немає. Запусти `python -m app.cli collect`.</div>';
+                    return;
+                }
+
+                container.innerHTML = `
+                    <table>
+                        <thead><tr><th>Канал</th><th>Постів</th><th>Останній збір</th></tr></thead>
+                        <tbody>
+                            ${channels.map(c => `
+                                <tr>
+                                    <td><span class="channel-name" data-channel="${c.channel}">@${c.channel}</span></td>
+                                    <td>${c.total_posts}</td>
+                                    <td>${c.last_fetched_at ? new Date(c.last_fetched_at).toLocaleString('uk-UA') : '—'}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
                 `;
-                container.appendChild(card);
-            });
+
+                select.innerHTML = channels.map(c => `<option value="${c.channel}">@${c.channel}</option>`).join('');
+
+                container.querySelectorAll('.channel-name').forEach(el => {
+                    el.addEventListener('click', () => {
+                        select.value = el.dataset.channel;
+                        loadTop();
+                    });
+                });
+
+                if (channels.length > 0) {
+                    selectedChannel = channels[0].channel;
+                    select.value = selectedChannel;
+                    loadTop();
+                }
+            } catch (err) {
+                container.innerHTML = `<div class="error">Не вдалося завантажити канали: ${err.message}</div>`;
+            }
         }
 
-        loadPosts();
+        async function loadTop() {
+            const container = document.getElementById('top-container');
+            const channel = document.getElementById('channel-select').value;
+            const days = document.getElementById('days-select').value;
+            if (!channel) return;
+
+            container.innerHTML = '<div class="loading">Завантаження...</div>';
+            try {
+                const response = await fetch(`/channels/${encodeURIComponent(channel)}/top?days=${days}`);
+                if (!response.ok) throw new Error(`Помилка сервера: ${response.status}`);
+                const posts = await response.json();
+
+                if (!Array.isArray(posts) || posts.length === 0) {
+                    container.innerHTML = '<div class="loading">Постів за цей період немає.</div>';
+                    return;
+                }
+
+                container.innerHTML = `
+                    <table>
+                        <thead><tr><th>Текст</th><th>Переглядів</th><th>Score</th><th>Дата</th></tr></thead>
+                        <tbody>
+                            ${posts.map(p => `
+                                <tr>
+                                    <td class="post-text">${(p.text || '<i>(без тексту)</i>').slice(0, 200)}</td>
+                                    <td>${p.current_views}</td>
+                                    <td class="score">${p.score}×</td>
+                                    <td>${p.datetime ? new Date(p.datetime).toLocaleString('uk-UA') : '—'}</td>
+                                </tr>
+                            `).join('')}
+                        </tbody>
+                    </table>
+                `;
+            } catch (err) {
+                container.innerHTML = `<div class="error">Не вдалося завантажити пости: ${err.message}</div>`;
+            }
+        }
+
+        document.getElementById('channel-select').addEventListener('change', loadTop);
+        document.getElementById('days-select').addEventListener('change', loadTop);
+
+        document.addEventListener('DOMContentLoaded', loadChannels);
     </script>
 </body>
 </html>

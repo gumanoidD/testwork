@@ -3,5 +3,6 @@ venv/
 __pycache__/
 *.pyc
 .pytest_cache/
-telegram_pulse.db
+*.db
 *.sqlite3
+.env

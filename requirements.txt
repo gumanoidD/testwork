@@ -1,4 +1,8 @@
 httpx
 beautifulsoup4
 fastapi
-uvicornuvicorn api:app --reload
+uvicorn
+pydantic-settings
+sqlalchemy
+alembic
+pytest

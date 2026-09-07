@@ -1,51 +1,99 @@
-from fastapi import FastAPI, Depends, Query
-from fastapi.responses import FileResponse
-from sqlalchemy.orm import Session
-from sqlalchemy import func
-from typing import Optional, List
-from datetime import datetime, timedelta
+import os
+from typing import List, Optional
+from datetime import datetime as dt_type, timedelta, timezone
 import statistics
+from fastapi import FastAPI, Depends, Query, HTTPException
+from fastapi.responses import FileResponse, HTMLResponse
+from sqlalchemy import func, desc, asc
+from sqlalchemy.orm import Session, joinedload
+from pydantic import BaseModel, ConfigDict, Field
 
-from app.database import get_db
+from app.database import SessionLocal, engine, Base
 from app.models import Post, PostMetric
 
-app = FastAPI(title="Channel Pulse API")
+Base.metadata.create_all(bind=engine)
 
-@app.get("/")
-def home():
-    return FileResponse("index.html")
+app = FastAPI(title="Telegram Channel Parser API")
 
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+# --- Pydantic Схемы ---
+class MetricSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    views: int
+    fetched_at: Optional[dt_type] = Field(default=None)
+
+class PostSchema(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    channel: str
+    message_id: int
+    text: Optional[str] = Field(default=None)
+    datetime: Optional[dt_type] = Field(default=None)
+    media_type: Optional[str] = Field(default=None)
+    forwarded_from: Optional[str] = Field(default=None)
+    fetched_at: Optional[dt_type] = Field(default=None)
+    metrics: List[MetricSchema] = []
+
+class TopPostSchema(PostSchema):
+    score: float
+    current_views: int
+
+class ChannelStatSchema(BaseModel):
+    channel: str
+    total_posts: int
+    last_fetched_at: Optional[dt_type] = None
+
+# --- Healthcheck ---
 @app.get("/healthz")
 def healthz():
     return {"status": "ok"}
 
-@app.get("/channels")
+# --- UI ---
+@app.get("/", response_class=HTMLResponse)
+def read_index():
+    possible_paths = ["index.html", "static/index.html", "app/static/index.html"]
+    for path in possible_paths:
+        if os.path.exists(path):
+            return FileResponse(path)
+    return "<h3>API Online. Go to <a href='/docs'>/docs</a></h3>"
+
+# --- Эндпоинты по ТЗ ---
+
+@app.get("/channels", response_model=List[ChannelStatSchema])
 def get_channels(db: Session = Depends(get_db)):
-    # Групуємо за каналами, рахуємо кількість постів та останній збір
+    """Список каналов с количеством постов и датой последнего сбора."""
     results = db.query(
         Post.channel,
         func.count(Post.id).label("total_posts"),
-        func.max(Post.fetched_at).label("last_fetched")
+        func.max(Post.fetched_at).label("last_fetched_at")
     ).group_by(Post.channel).all()
 
     return [
-        {
-            "channel": r.channel,
-            "total_posts": r.total_posts,
-            "last_fetched": r.last_fetched
-        }
-        for r in results
+        ChannelStatSchema(
+            channel=r.channel,
+            total_posts=r.total_posts,
+            last_fetched_at=r.last_fetched_at
+        ) for r in results
     ]
 
-@app.get("/posts")
+@app.get("/posts", response_model=List[PostSchema])
 def get_posts(
-    channel: Optional[str] = None,
-    since: Optional[str] = None,
-    limit: int = Query(10, ge=1, le=100),
-    order: str = Query("date", pattern="^(views|date)$"),
+    channel: Optional[str] = Query(None, description="Фильтр по каналу"),
+    since: Optional[dt_type] = Query(None, description="Фильтр по дате (ISO format)"),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    order: str = Query("date", pattern="^(date|views)$", description="Сортировка: date или views"),
     db: Session = Depends(get_db)
 ):
-    query = db.query(Post)
+    """Список постов с фильтрацией, пагинацией и сортировкой."""
+    query = db.query(Post).options(joinedload(Post.metrics))
 
     if channel:
         query = query.filter(Post.channel == channel)
@@ -53,79 +101,58 @@ def get_posts(
         query = query.filter(Post.datetime >= since)
 
     if order == "date":
-        query = query.order_by(Post.id.desc())
-    else:
-        # Сортування за останньою збереженою метрикою переглядів
-        query = query.order_by(Post.id.desc())
+        query = query.order_by(Post.datetime.desc())
+    elif order == "views":
+        # Сортировка по последним просмотрам
+        subq = db.query(
+            PostMetric.post_id,
+            func.max(PostMetric.views).label("max_views")
+        ).group_by(PostMetric.post_id).subquery()
 
-    posts = query.limit(limit).all()
+        query = query.outerjoin(subq, Post.id == subq.c.post_id).order_by(desc(subq.c.max_views))
 
-    response = []
-    for post in posts:
-        latest_metric = db.query(PostMetric).filter(PostMetric.post_id == post.id).order_by(PostMetric.id.desc()).first()
-        views = latest_metric.views if latest_metric else "0"
-        
-        response.append({
-            "id": post.id,
-            "channel": post.channel,
-            "message_id": post.message_id,
-            "text": post.text,
-            "date": post.datetime,
-            "views": views,
-            "media_type": post.media_type
-        })
+    return query.offset(offset).limit(limit).all()
 
-    return response
+@app.get("/channels/{name}/top", response_model=List[TopPostSchema])
+def get_channel_top(
+    name: str,
+    days: int = Query(7, ge=1, le=365),
+    limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db)
+):
+    """Топ-посты за N дней относительно медианы канала."""
+    cutoff = dt_type.now(timezone.utc) - timedelta(days=days)
 
-@app.get("/channels/{name}/top")
-def get_top_posts(name: str, days: int = 7, db: Session = Depends(get_db)):
-    posts = db.query(Post).filter(Post.channel == name).all()
+    posts = db.query(Post).options(joinedload(Post.metrics)).filter(
+        Post.channel == name,
+        Post.datetime >= cutoff
+    ).all()
+
     if not posts:
-        return {"channel": name, "top_posts": []}
+        return []
 
-    # Парсимо перегляди в числове значення для розрахунку медіани
-    post_data = []
-    views_list = []
-    
+    # Собираем актуальные просмотры для каждого поста
+    post_views_map = []
     for p in posts:
-        metric = db.query(PostMetric).filter(PostMetric.post_id == p.id).order_by(PostMetric.id.desc()).first()
-        raw_views = metric.views if metric else "0"
-        
-        # Конвертуємо "1.2M" або "500" у число
-        num_views = 0
-        if "M" in raw_views:
-            num_views = int(float(raw_views.replace("M", "")) * 1_000_000)
-        elif "K" in raw_views:
-            num_views = int(float(raw_views.replace("K", "")) * 1_000)
-        else:
-            try:
-                num_views = int(raw_views)
-            except ValueError:
-                num_views = 0
+        latest_views = p.metrics[-1].views if p.metrics else 0
+        post_views_map.append((p, latest_views))
 
-        views_list.append(num_views)
-        post_data.append({
-            "id": p.id,
-            "message_id": p.message_id,
-            "text": p.text,
-            "views_raw": raw_views,
-            "views_num": num_views
-        })
+    all_views = [v for _, v in post_views_map]
+    if not all_views:
+        return []
 
-    # Обчислюємо медіану каналу
-    channel_median = statistics.median(views_list) if views_list else 1
-    if channel_median == 0:
-        channel_median = 1
+    med = statistics.median(all_views)
+    if med == 0:
+        med = 1.0  # Избегаем деления на 0
 
-    # Відносний коефіцієнт (score = views / median)
-    for p in post_data:
-        p["score"] = round(p["views_num"] / channel_median, 2)
+    result = []
+    for p, v in post_views_map:
+        score = round(v / med, 2)
+        p_dict = PostSchema.model_validate(p).model_dump()
+        p_dict["score"] = score
+        p_dict["current_views"] = v
+        result.append(p_dict)
 
-    # Сортуємо за відносним коефіцієнтом
-    top_posts = sorted(post_data, key=lambda x: x["score"], reverse=True)
-
-    return {
-        "channel": name,
-        "median_views": channel_median,
-        "top_posts": top_posts[:5]
-    }
+    # Сортируем по score
+    result.sort(key=lambda x: x["score"], reverse=True)
+    return result[:limit]
